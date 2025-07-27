@@ -16,6 +16,7 @@ from loguru import logger
 import traceback
 
 app = FastAPI()
+# changes
 
 class UpscaleRequest(BaseModel):
     payload_url: str
