@@ -10,7 +10,7 @@ from vidaio_subnet_core.global_config import CONFIG
 
 
 class BackblazeClient:
-    def __init__(self, endpoint, access_key, secret_key, bucket_name, secure=True, region="us-east-1"):
+    def __init__(self, endpoint, access_key, secret_key, bucket_name, secure=True, region="us-east-2"):
         self.endpoint = endpoint
         self.bucket_name = bucket_name
         self.client = Minio(
@@ -117,7 +117,7 @@ class BackblazeClient:
 
 
 class AmazonS3Client:
-    def __init__(self, endpoint, access_key, secret_key, bucket_name, secure=True, region="eu-west-1"):
+    def __init__(self, endpoint, access_key, secret_key, bucket_name, secure=True, region="eu-east-2"):
         self.endpoint = endpoint
         self.bucket_name = bucket_name
         

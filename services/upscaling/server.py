@@ -13,7 +13,8 @@ import traceback
 import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-
+import subprocess
+import random
 app = FastAPI()
 # changes
 
@@ -32,7 +33,7 @@ S3_SECRET_KEY = os.getenv('BUCKET_COMPATIBLE_SECRET_KEY')
 
 s3_client = boto3.client(
     's3',
-    endpoint_url=S3_ENDPOINT,
+    region_name='us-east-2',
     aws_access_key_id=S3_ACCESS_KEY,
     aws_secret_access_key=S3_SECRET_KEY
 )
@@ -45,7 +46,12 @@ APP_PY_UPSCALE_URL = "http://localhost:8006/upscale-only/"  # Change if app.py r
 def upload_to_s3(file_path: str, object_name: str) -> str:
     try:
         s3_client.upload_file(file_path, S3_BUCKET, object_name)
-        url = f"{S3_ENDPOINT}/{S3_BUCKET}/{object_name}"
+        # Generate a presigned URL for the uploaded object (valid for 7 days)
+        url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': S3_BUCKET, 'Key': object_name},
+            ExpiresIn=604800  # 7 days
+        )
         return url
     except ClientError as e:
         logger.error(f"S3 upload failed: {e}")
@@ -98,11 +104,104 @@ async def video_upscaler(request: UpscaleRequest):
         payload_video_path: str = await download_video(payload_url)
         logger.info(f"Download video finished, Path: {payload_video_path}")
 
+
         # Call the upscaler endpoint with the correct scale_factor
         processed_video_path = await call_upscaler_endpoint(payload_video_path, scale_factor=scale_factor)
         processed_video_name = Path(processed_video_path).name
 
         logger.info(f"Processed video path: {processed_video_path}, video name: {processed_video_name}")
+
+        # --- Direct scoring: import and call metrics ---
+        import sys
+        import numpy as np
+        import cv2
+        sys.path.append(os.path.dirname(__file__))
+        try:
+            from services.scoring.vmaf_metric import calculate_vmaf, convert_mp4_to_y4m
+        except ImportError:
+            from vidaio_subnet.services.scoring.vmaf_metric import calculate_vmaf, convert_mp4_to_y4m
+        try:
+            from services.scoring.lpips_metric import calculate_lpips
+        except ImportError:
+            from vidaio_subnet.services.scoring.lpips_metric import calculate_lpips
+        try:
+            from services.scoring.pieapp_metric import calculate_pieapp_score
+        except ImportError:
+            from vidaio_subnet.services.scoring.pieapp_metric import calculate_pieapp_score
+
+        # Downscale processed video to reference resolution for scoring
+        ref_cap = cv2.VideoCapture(payload_video_path)
+        ref_width = int(ref_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        ref_height = int(ref_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        ref_total_frames = int(ref_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        ref_cap.release()
+        downscaled_proc_path = processed_video_path.replace('.mp4', '_downscaled_for_score.mp4')
+        cmd = [
+            "ffmpeg", "-y", "-i", processed_video_path,
+            "-vf", f"scale={ref_width}:{ref_height}",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-an",
+            downscaled_proc_path
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logger.info(f"Downscaled processed video for scoring: {downscaled_proc_path}")
+
+        # VMAF
+        VMAF_SAMPLE_COUNT = 8
+        random_frames = sorted(random.sample(range(ref_total_frames), VMAF_SAMPLE_COUNT)) if ref_total_frames >= VMAF_SAMPLE_COUNT else list(range(ref_total_frames))
+        ref_y4m_path = convert_mp4_to_y4m(payload_video_path, random_frames)
+        try:
+            vmaf_score = calculate_vmaf(ref_y4m_path, downscaled_proc_path, random_frames)
+        except Exception as e:
+            logger.warning(f"VMAF calculation failed: {e}")
+            vmaf_score = None
+
+        # PieAPP, LPIPS, PSNR on sampled frames
+        PIEAPP_SAMPLE_COUNT = 8
+        sample_size = min(PIEAPP_SAMPLE_COUNT, ref_total_frames)
+        max_start_frame = ref_total_frames - sample_size
+        start_frame = 0 if max_start_frame <= 0 else random.randint(0, max_start_frame)
+        ref_cap = cv2.VideoCapture(payload_video_path)
+        ref_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        ref_frames = []
+        for _ in range(sample_size):
+            ret, frame = ref_cap.read()
+            if not ret:
+                break
+            ref_frames.append(frame)
+        ref_cap.release()
+        proc_cap = cv2.VideoCapture(downscaled_proc_path)
+        proc_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        proc_frames = []
+        for _ in range(sample_size):
+            ret, frame = proc_cap.read()
+            if not ret:
+                break
+            proc_frames.append(frame)
+        proc_cap.release()
+
+        lpips_score = None
+        pieapp_score = None
+        psnr_score = None
+        if ref_frames and proc_frames and len(ref_frames) == len(proc_frames):
+            try:
+                lpips_vals = [calculate_lpips(rf, pf) for rf, pf in zip(ref_frames, proc_frames) if isinstance(rf, np.ndarray) and isinstance(pf, np.ndarray) and rf.shape == pf.shape]
+                lpips_score = float(np.mean(lpips_vals)) if lpips_vals else None
+            except Exception as e:
+                logger.warning(f"LPIPS calculation failed: {e}")
+            try:
+                pieapp_vals = [calculate_pieapp_score(rf, pf) for rf, pf in zip(ref_frames, proc_frames) if isinstance(rf, np.ndarray) and isinstance(pf, np.ndarray) and rf.shape == pf.shape]
+                pieapp_score = float(np.mean(pieapp_vals)) if pieapp_vals else None
+            except Exception as e:
+                logger.warning(f"PieAPP calculation failed: {e}")
+            try:
+                psnr_vals = [cv2.PSNR(rf, pf) for rf, pf in zip(ref_frames, proc_frames) if isinstance(rf, np.ndarray) and isinstance(pf, np.ndarray) and rf.shape == pf.shape]
+                psnr_score = float(np.mean(psnr_vals)) if psnr_vals else None
+            except Exception as e:
+                logger.warning(f"PSNR calculation failed: {e}")
+        else:
+            logger.warning("Frame sampling failed or frame count mismatch for scoring.")
+
+        logger.info(f"Scoring results: VMAF={vmaf_score}, PieAPP={pieapp_score}, LPIPS={lpips_score}, PSNR={psnr_score}")
 
         if processed_video_path is not None:
             object_name: str = processed_video_name
@@ -124,7 +223,14 @@ async def video_upscaler(request: UpscaleRequest):
                 logger.warning(f"Failed to schedule deletion of {object_name}")
 
             logger.info(f"Public S3 download link: {s3_url}")
-            return {"uploaded_video_url": s3_url, "scale_factor": scale_factor}
+            return {
+                "uploaded_video_url": s3_url,
+                "scale_factor": scale_factor,
+                "vmaf": vmaf_score,
+                "pieapp": pieapp_score,
+                "lpips": lpips_score,
+                "psnr": psnr_score
+            }
 
     except Exception as e:
         logger.error(f"Failed to process upscaling request: {e}")
