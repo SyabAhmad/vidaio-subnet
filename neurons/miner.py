@@ -23,34 +23,34 @@ class Miner(BaseMiner):
     async def forward_upscaling_requests(self, synapse: VideoUpscalingProtocol) -> VideoUpscalingProtocol:
         """
         Processes a video upscaling request by downloading, upscaling,
-        uploading, and returning a sharing link.
+        uploading, and returning a sharing link. Uses scale_factor from validator request if present.
         """
-        
         start_time = time.time()
 
-        task_type: str = synapse.miner_payload.task_type      
+        task_type: str = synapse.miner_payload.task_type
         payload_url: str = synapse.miner_payload.reference_video_url
+        scale_factor = getattr(synapse.miner_payload, 'scale_factor', None)
         validator_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
 
-        logger.info(f"✅✅✅ Receiving {task_type} Request from validator: {synapse.dendrite.hotkey} with uid: {validator_uid}: round_id : {synapse.round_id}")
-        
+        logger.info(f"✅✅✅ Receiving {task_type} Request from validator: {synapse.dendrite.hotkey} with uid: {validator_uid}: round_id : {synapse.round_id}, scale_factor: {scale_factor}")
+
         check_version(synapse.version)
 
         try:
-            processed_video_url = await video_upscaler(payload_url, task_type)
-            
+            # Pass scale_factor if present, else fallback to task_type logic in video_upscaler
+            processed_video_url = await video_upscaler(payload_url, task_type, scale_factor=scale_factor)
+
             if processed_video_url is None:
                 logger.info(f"💔 Failed to upscaling video 💔")
                 return synapse
-            
+
             synapse.miner_response.optimized_video_url = processed_video_url
 
             processed_time = time.time() - start_time
 
             logger.info(f"💜 Returning Response, Processed in {processed_time:.2f} seconds 💜")
-            
             return synapse
-            
+
         except Exception as e:
             logger.error(f"Failed to process upscaling request: {e}")
             traceback.print_exc()

@@ -179,9 +179,11 @@ async def video_upscaler(request: UpscaleRequest):
             proc_frames.append(frame)
         proc_cap.release()
 
+
         lpips_score = None
         pieapp_score = None
         psnr_score = None
+        ssim_score = None
         if ref_frames and proc_frames and len(ref_frames) == len(proc_frames):
             try:
                 lpips_vals = [calculate_lpips(rf, pf) for rf, pf in zip(ref_frames, proc_frames) if isinstance(rf, np.ndarray) and isinstance(pf, np.ndarray) and rf.shape == pf.shape]
@@ -198,10 +200,23 @@ async def video_upscaler(request: UpscaleRequest):
                 psnr_score = float(np.mean(psnr_vals)) if psnr_vals else None
             except Exception as e:
                 logger.warning(f"PSNR calculation failed: {e}")
+            try:
+                from skimage.metrics import structural_similarity as ssim
+                ssim_vals = []
+                for rf, pf in zip(ref_frames, proc_frames):
+                    if isinstance(rf, np.ndarray) and isinstance(pf, np.ndarray) and rf.shape == pf.shape:
+                        # Convert to grayscale for SSIM
+                        rf_gray = cv2.cvtColor(rf, cv2.COLOR_BGR2GRAY)
+                        pf_gray = cv2.cvtColor(pf, cv2.COLOR_BGR2GRAY)
+                        ssim_val = ssim(rf_gray, pf_gray, data_range=255)
+                        ssim_vals.append(ssim_val)
+                ssim_score = float(np.mean(ssim_vals)) if ssim_vals else None
+            except Exception as e:
+                logger.warning(f"SSIM calculation failed: {e}")
         else:
             logger.warning("Frame sampling failed or frame count mismatch for scoring.")
 
-        logger.info(f"Scoring results: VMAF={vmaf_score}, PieAPP={pieapp_score}, LPIPS={lpips_score}, PSNR={psnr_score}")
+        logger.info(f"Scoring results: VMAF={vmaf_score}, PieAPP={pieapp_score}, LPIPS={lpips_score}, PSNR={psnr_score}, SSIM={ssim_score}")
 
         if processed_video_path is not None:
             object_name: str = processed_video_name
@@ -229,7 +244,8 @@ async def video_upscaler(request: UpscaleRequest):
                 "vmaf": vmaf_score,
                 "pieapp": pieapp_score,
                 "lpips": lpips_score,
-                "psnr": psnr_score
+                "psnr": psnr_score,
+                "ssim": ssim_score
             }
 
     except Exception as e:
