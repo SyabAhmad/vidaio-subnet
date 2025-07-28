@@ -38,7 +38,7 @@ class Miner(BaseMiner):
 
         try:
             # Pass scale_factor if present, else fallback to task_type logic in video_upscaler
-            processed_video_url = await video_upscaler(payload_url, task_type, scale_factor=scale_factor)
+            processed_video_url = await video_upscaler(payload_url, task_type)
 
             if processed_video_url is None:
                 logger.info(f"💔 Failed to upscaling video 💔")

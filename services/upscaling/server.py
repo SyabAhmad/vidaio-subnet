@@ -95,10 +95,16 @@ async def video_upscaler(request: UpscaleRequest):
     try:
         payload_url = request.payload_url
         task_type = request.task_type.upper() if request.task_type else ""
+
         # Determine scale_factor: prefer explicit, else map from task_type, else default to 4
         scale_factor = request.scale_factor
         if not scale_factor:
-            scale_factor = TASK_TYPE_TO_SCALE.get(task_type, 4)
+            scale_factor = TASK_TYPE_TO_SCALE.get(task_type, 2)
+        # Ensure scale_factor is int for downstream use
+        try:
+            scale_factor = int(scale_factor)
+        except Exception:
+            scale_factor = 2
 
         logger.info(f"📻 Downloading video from {payload_url} ...")
         payload_video_path: str = await download_video(payload_url)
@@ -184,20 +190,44 @@ async def video_upscaler(request: UpscaleRequest):
         pieapp_score = None
         psnr_score = None
         ssim_score = None
+        logger.info(f"[DEBUG] ref_frames: {len(ref_frames) if ref_frames else 0}, proc_frames: {len(proc_frames) if proc_frames else 0}")
+        if ref_frames:
+            logger.info(f"[DEBUG] ref_frames[0] shape: {getattr(ref_frames[0], 'shape', None)}")
+        if proc_frames:
+            logger.info(f"[DEBUG] proc_frames[0] shape: {getattr(proc_frames[0], 'shape', None)}")
         if ref_frames and proc_frames and len(ref_frames) == len(proc_frames):
             try:
                 lpips_vals = [calculate_lpips(rf, pf) for rf, pf in zip(ref_frames, proc_frames) if isinstance(rf, np.ndarray) and isinstance(pf, np.ndarray) and rf.shape == pf.shape]
                 lpips_score = float(np.mean(lpips_vals)) if lpips_vals else None
+                try:
+                    ref_cap = cv2.VideoCapture(payload_video_path)
+                    proc_cap = cv2.VideoCapture(downscaled_proc_path)
+                    pieapp_score = calculate_pieapp_score(ref_cap, proc_cap, frame_interval=30)  # adjust interval as needed
+                except Exception as e:
+                    logger.warning(f"PieAPP calculation failed: {e}")
+                    pieapp_score = None
+                logger.info(f"[DEBUG] LPIPS values: {lpips_vals}")
             except Exception as e:
                 logger.warning(f"LPIPS calculation failed: {e}")
             try:
-                pieapp_vals = [calculate_pieapp_score(rf, pf) for rf, pf in zip(ref_frames, proc_frames) if isinstance(rf, np.ndarray) and isinstance(pf, np.ndarray) and rf.shape == pf.shape]
-                pieapp_score = float(np.mean(pieapp_vals)) if pieapp_vals else None
+                ref_cap = cv2.VideoCapture(payload_video_path)
+                proc_cap = cv2.VideoCapture(downscaled_proc_path)
+                pieapp_score = calculate_pieapp_score(ref_cap, proc_cap, frame_interval=30)  # adjust interval as needed
+                logger.info(f"[DEBUG] PieAPP score: {pieapp_score}")
             except Exception as e:
                 logger.warning(f"PieAPP calculation failed: {e}")
+                pieapp_score = None
+                logger.warning(f"PieApp Score: {pieapp_score}")
+            # try:
+            #     pieapp_vals = [calculate_pieapp_score(rf, pf) for rf, pf in zip(ref_frames, proc_frames) if isinstance(rf, np.ndarray) and isinstance(pf, np.ndarray) and rf.shape == pf.shape]
+            #     logger.info(f"[DEBUG] PieAPP values: {pieapp_vals}")
+            #     pieapp_score = float(np.mean(pieapp_vals)) if pieapp_vals else None
+            # except Exception as e:
+            #     logger.warning(f"PieAPP calculation failed: {e}")
             try:
                 psnr_vals = [cv2.PSNR(rf, pf) for rf, pf in zip(ref_frames, proc_frames) if isinstance(rf, np.ndarray) and isinstance(pf, np.ndarray) and rf.shape == pf.shape]
                 psnr_score = float(np.mean(psnr_vals)) if psnr_vals else None
+                logger.info(f"[DEBUG] PSNR values: {psnr_vals}")
             except Exception as e:
                 logger.warning(f"PSNR calculation failed: {e}")
             try:
@@ -211,10 +241,11 @@ async def video_upscaler(request: UpscaleRequest):
                         ssim_val = ssim(rf_gray, pf_gray, data_range=255)
                         ssim_vals.append(ssim_val)
                 ssim_score = float(np.mean(ssim_vals)) if ssim_vals else None
+                logger.info(f"[DEBUG] SSIM values: {ssim_vals}")
             except Exception as e:
                 logger.warning(f"SSIM calculation failed: {e}")
         else:
-            logger.warning("Frame sampling failed or frame count mismatch for scoring.")
+            logger.warning(f"Frame sampling failed or frame count mismatch for scoring. ref_frames: {len(ref_frames) if ref_frames else 0}, proc_frames: {len(proc_frames) if proc_frames else 0}")
 
         logger.info(f"Scoring results: VMAF={vmaf_score}, PieAPP={pieapp_score}, LPIPS={lpips_score}, PSNR={psnr_score}, SSIM={ssim_score}")
 
