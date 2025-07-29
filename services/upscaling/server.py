@@ -268,6 +268,21 @@ async def video_upscaler(request: UpscaleRequest):
             else:
                 logger.warning(f"Failed to schedule deletion of {object_name}")
 
+            # Schedule deletion of the downscaled video used for scoring
+            downscaled_object_name = os.path.basename(downscaled_proc_path)
+            downscaled_deletion_scheduled = schedule_file_deletion(downscaled_object_name)
+            if downscaled_deletion_scheduled:
+                logger.info(f"Scheduled deletion of downscaled scoring file {downscaled_object_name} after 10 minutes")
+            else:
+                logger.warning(f"Failed to schedule deletion of downscaled scoring file {downscaled_object_name}")
+
+            # Optionally, delete the local downscaled file immediately (if not needed for other tasks)
+            if os.path.exists(downscaled_proc_path):
+                os.remove(downscaled_proc_path)
+                logger.info(f"{downscaled_proc_path} has been deleted.")
+            else:
+                logger.info(f"{downscaled_proc_path} does not exist.")
+
             logger.info(f"Public S3 download link: {s3_url}")
             return {
                 "uploaded_video_url": s3_url,
