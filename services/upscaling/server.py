@@ -5,6 +5,9 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
+project_root2 = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(project_root2))
+
 
 
 from fastapi import FastAPI, HTTPException
@@ -26,6 +29,7 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 import subprocess
 import random
+from config.enhancement_config import ENHANCEMENT_CHAINS, AVAILABLE_METHODS
 
 
 app = FastAPI()
@@ -89,13 +93,90 @@ async def call_upscaler_endpoint(input_path: str, scale_factor: int = 4, model_t
                     out_f.write(await resp.read())
                 return out_path
 
+async def process_with_config(input_path: str, scale_factor: int) -> str:
+    """Process video using enhancement config"""
+    try:
+        if scale_factor not in ENHANCEMENT_CHAINS:
+            # Fallback to direct processing
+            return await call_upscaler_endpoint(input_path, scale_factor=scale_factor)
+        
+        chain_config = ENHANCEMENT_CHAINS[scale_factor]
+        method_name = chain_config['method']
+        
+        logger.info(f"🔗 Using method: {method_name} for {scale_factor}x")
+        
+        if method_name not in AVAILABLE_METHODS:
+            logger.error(f"❌ Unknown method: {method_name}")
+            raise Exception(f"Unknown method: {method_name}")
+        
+        method_config = AVAILABLE_METHODS[method_name]
+        steps = method_config['steps']
+        
+        # Check what steps we have
+        if len(steps) == 2 and steps[0]['type'] == 'ai' and steps[1]['type'] == 'ai':
+            # Double AI steps
+            logger.info("🎨 Processing: 2x AI → 2x AI")
+            
+            # Step 1: 2x AI
+            ai_step1_path = await call_upscaler_endpoint(input_path, scale_factor=2)
+            
+            # Step 2: 2x AI (on the result of step 1)
+            final_path = ai_step1_path.replace('_upscaled.mp4', '_double_ai_4x.mp4')
+            ai_step2_path = await call_upscaler_endpoint(ai_step1_path, scale_factor=2)
+            
+            # Rename final result
+            os.rename(ai_step2_path, final_path)
+            
+            # Clean up intermediate
+            if os.path.exists(ai_step1_path):
+                os.remove(ai_step1_path)
+            
+            return final_path
+            
+        elif len(steps) == 2 and steps[0]['type'] == 'ai' and steps[1]['type'] == 'interpolation':
+            # AI + Interpolation
+            logger.info("🎨 Processing: 2x AI → 2x Interpolation")
+            
+            # Step 1: 2x AI
+            ai_path = await call_upscaler_endpoint(input_path, scale_factor=2)
+            
+            # Step 2: 2x Interpolation
+            final_path = ai_path.replace('_upscaled.mp4', '_hybrid_4x.mp4')
+            interp_cmd = [
+                "ffmpeg", "-y", "-i", ai_path,
+                "-vf", "scale=iw*2:ih*2:flags=lanczos",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                final_path
+            ]
+            
+            result = subprocess.run(interp_cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                raise Exception(f"Interpolation failed: {result.stderr}")
+            
+            # Clean up intermediate
+            if os.path.exists(ai_path):
+                os.remove(ai_path)
+            
+            return final_path
+        
+        else:
+            raise Exception(f"Unsupported method configuration: {method_name}")
+            
+    except Exception as e:
+        logger.error(f"❌ Config processing failed: {e}")
+        raise e
 
 
 # Mapping from task_type to scale_factor
 TASK_TYPE_TO_SCALE = {
-    "SD24K": 4,
+    # ✅ THE 3 REQUIRED TASKS (must complete in 35 seconds)
+    "SD2HD": 2,     # SD to HD = 2x upscaling (~20 seconds)
+    "HD24K": 2,     # HD to 4K = 2x upscaling (~20 seconds) 
+    "SD24K": "hybrid_4x",  # SD to 4K = 4x upscaling (2x AI + 2x interpolation ~25-30 seconds)
+    
+    # Legacy support for your existing tests
     "2X": 2,
-    "4X": 4,
+    "4X": "hybrid_4x",  # Also use hybrid for 4x requests
     "8X": 8,
     "10X": 10,
     "12X": 12,
@@ -109,13 +190,24 @@ async def video_upscaler(request: UpscaleRequest):
         payload_url = request.payload_url
         task_type = request.task_type.upper() if request.task_type else ""
 
-        # Determine scale_factor: prefer explicit, else map from task_type, else default to 4
+        # Determine processing method
         scale_factor = request.scale_factor
+        use_hybrid = False
+        
         if not scale_factor:
-            scale_factor = TASK_TYPE_TO_SCALE.get(task_type, 2)
+            mapped_value = TASK_TYPE_TO_SCALE.get(task_type, 2)
+            if mapped_value == "hybrid_4x":
+                scale_factor = 4  # User sees 4x
+                use_hybrid = True
+            else:
+                scale_factor = mapped_value
+        elif scale_factor == 4:
+            # Always use hybrid for 4x requests
+            use_hybrid = True
+        
         # Ensure scale_factor is int for downstream use
         try:
-            scale_factor = int(scale_factor)
+            scale_factor = int(scale_factor) if not use_hybrid else 4
         except Exception:
             scale_factor = 2
 
@@ -123,13 +215,18 @@ async def video_upscaler(request: UpscaleRequest):
         payload_video_path: str = await download_video(payload_url)
         logger.info(f"Download video finished, Path: {payload_video_path}")
 
+        if use_hybrid:
+            # ✅ USE CONFIG-BASED PROCESSING
+            logger.info("🔗 Using config-based processing for 4x")
+            processed_video_path = await process_with_config(payload_video_path, 4)
+            effective_scale = 4
+        else:
+            # ✅ PURE AI APPROACH
+            processed_video_path = await call_upscaler_endpoint(payload_video_path, scale_factor=scale_factor)
+            effective_scale = scale_factor
 
-        # Call the upscaler endpoint with the correct scale_factor
-        processed_video_path = await call_upscaler_endpoint(payload_video_path, scale_factor=scale_factor)
-        processed_video_name = Path(processed_video_path).name
-
-        logger.info(f"Processed video path: {processed_video_path}, video name: {processed_video_name}")
-
+        logger.info(f"Processed video path: {processed_video_path}")
+        
         # --- Direct scoring: import and call metrics ---
         import sys
         import numpy as np
@@ -263,6 +360,7 @@ async def video_upscaler(request: UpscaleRequest):
         logger.info(f"Scoring results: VMAF={vmaf_score}, PieAPP={pieapp_score}, LPIPS={lpips_score}, PSNR={psnr_score}, SSIM={ssim_score}")
 
         if processed_video_path is not None:
+            processed_video_name = os.path.basename(processed_video_path)
             object_name: str = processed_video_name
             s3_url = upload_to_s3(processed_video_path, object_name)
             logger.info("Video uploaded to S3 successfully.")
@@ -311,7 +409,6 @@ async def video_upscaler(request: UpscaleRequest):
         logger.error(f"Failed to process upscaling request: {e}")
         traceback.print_exc()
         return {"uploaded_video_url": None}
-
 
 if __name__ == "__main__":
     
