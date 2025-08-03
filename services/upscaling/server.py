@@ -1,9 +1,20 @@
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
+
+
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pathlib import Path
 import os
 import aiohttp
 import asyncio
+
+
 from vidaio_subnet_core import CONFIG
 from typing import Optional
 from services.miner_utilities.redis_utils import schedule_file_deletion
@@ -15,6 +26,8 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 import subprocess
 import random
+
+
 app = FastAPI()
 # changes
 
